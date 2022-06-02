@@ -461,14 +461,13 @@ bool callingThreadHasRotateSurfaceFlingerAccess() {
             PermissionCache::checkPermission(sRotateSurfaceFlinger, pid, uid);
 }
 
-void SurfaceFlinger::setRefreshRates(
-       std::unique_ptr<scheduler::RefreshRateConfigs> &refreshRateConfigs) {
+void SurfaceFlinger::setRefreshRates(const sp<DisplayDevice>& display) {
     // Get Primary Smomo Instance.
     std::vector<float> refreshRates;
 
-    auto iter = refreshRateConfigs->getAllRefreshRates().cbegin();
-    while (iter != refreshRateConfigs->getAllRefreshRates().cend()) {
-        if (refreshRateConfigs->isModeAllowed(iter->second->getModeId())) {
+    auto iter = display->refreshRateConfigs().getAllRefreshRates().cbegin();
+    while (iter != display->refreshRateConfigs().getAllRefreshRates().cend()) {
+        if (display->refreshRateConfigs().isModeAllowed(iter->second->getModeId())) {
             refreshRates.push_back(iter->second->getFps().getValue());
         }
         ++iter;
@@ -1263,8 +1262,8 @@ void SurfaceFlinger::createSmomoInstance(const DisplayDeviceState& state) {
                 setRefreshRateTo(refreshRate);
            });
 
-    // b/223439401 Fix the following value-add
-    // setRefreshRates(mRefreshRateConfigs);
+    const auto display = getDefaultDisplayDeviceLocked();
+    setRefreshRates(display);
 
     if (mSmomoInstances.size() > 1) {
         // Disable DRC on all instances.
@@ -3291,6 +3290,10 @@ void SurfaceFlinger::UpdateSmomoState() {
         return;
     }
 
+    mDrawingState.traverse([&](Layer* layer) {
+    layer->setSmomoLayerStackId();
+    });
+
     // Disable smomo if external or virtual is connected.
     bool enableSmomo = mSmomoInstances.size() == mDisplays.size();
     uint32_t fps = 0;
@@ -4764,6 +4767,7 @@ bool SurfaceFlinger::transactionIsReadyToBeApplied(
             if (smoMo) {
                 ATRACE_BEGIN("smomo_begin");
                 if (smoMo->FrameIsEarly(layer->getSequence(), desiredPresentTime)) {
+                    ATRACE_END();
                     return false;
                 }
                 ATRACE_END();
@@ -4895,11 +4899,15 @@ status_t SurfaceFlinger::setTransactionState(
     }
 
     state.traverseStatesWithBuffers([&](const layer_state_t& state) {
-        sp<Layer> layer = fromHandle(state.surface).promote();
-        if (layer != nullptr) {
-            SmomoIntf *smoMo = nullptr;
-            if (mSmomoInstances.size() > 1) {
-                const uint32_t layerStackId = layer->getLayerStack();
+        SmomoIntf *smoMo = nullptr;
+        int32_t sequence;
+        sp<Layer> layer = nullptr;
+        {
+            Mutex::Autolock _l(mStateLock);
+            layer = fromHandle(state.surface).promote();
+            if (layer != nullptr) {
+                const uint32_t layerStackId = layer->getSmomoLayerStackId();
+                sequence = layer->getSequence();
                 for (auto &instance: mSmomoInstances) {
                      if (instance.layerStackId == layerStackId) {
                         smoMo = instance.smoMo;
@@ -4907,24 +4915,21 @@ status_t SurfaceFlinger::setTransactionState(
                     }
                 }
             }
-            else if (mSmomoInstances.size() == 1) {
-                smoMo = mSmomoInstances[0].smoMo;
-            }
+        }
 
-            if (smoMo) {
-               smomo::SmomoBufferStats bufferStats;
-               const nsecs_t now = systemTime(SYSTEM_TIME_MONOTONIC);
-               bufferStats.id = layer->getSequence();
-               bufferStats.auto_timestamp = isAutoTimestamp;
-               bufferStats.timestamp = now;
-               bufferStats.dequeue_latency = 0;
-               bufferStats.key = desiredPresentTime;
-               smoMo->CollectLayerStats(bufferStats);
+        if (smoMo) {
+           smomo::SmomoBufferStats bufferStats;
+           const nsecs_t now = systemTime(SYSTEM_TIME_MONOTONIC);
+           bufferStats.id = sequence;
+           bufferStats.auto_timestamp = isAutoTimestamp;
+           bufferStats.timestamp = now;
+           bufferStats.dequeue_latency = 0;
+           bufferStats.key = desiredPresentTime;
+           smoMo->CollectLayerStats(bufferStats);
 
-               const DisplayStatInfo stats = mScheduler->getDisplayStatInfo(now);
-               if (smoMo->FrameIsLate(bufferStats.id, stats.vsyncTime)) {
-                  signalImmedLayerUpdate();
-                }
+           const DisplayStatInfo stats = mScheduler->getDisplayStatInfo(now);
+           if (smoMo->FrameIsLate(bufferStats.id, stats.vsyncTime)) {
+              signalImmedLayerUpdate();
             }
         }
     });
@@ -5023,46 +5028,60 @@ void SurfaceFlinger::applyTransactionState(const FrameTimelineInfo& frameTimelin
 }
 
 void SurfaceFlinger::checkVirtualDisplayHint(const Vector<DisplayState>& displays) {
-    for (const DisplayState& s : displays) {
-        const ssize_t index = mCurrentState.displays.indexOfKey(s.token);
-        if (index < 0)
-            continue;
-
-        DisplayDeviceState& state = mCurrentState.displays.editValueAt(index);
-        const uint32_t what = s.what;
-        if (what & DisplayState::eSurfaceChanged) {
-            if (IInterface::asBinder(state.surface) != IInterface::asBinder(s.surface)) {
-                if (state.isVirtual() && s.surface != nullptr &&
-                    mVirtualDisplayIdGenerators.hal) {
-                    int width = 0;
-                    int status = s.surface->query(NATIVE_WINDOW_WIDTH, &width);
-                    ALOGE_IF(status != NO_ERROR, "Unable to query width (%d)", status);
-                    int height = 0;
-                    status = s.surface->query(NATIVE_WINDOW_HEIGHT, &height);
-                    ALOGE_IF(status != NO_ERROR, "Unable to query height (%d)", status);
-                    int format = 0;
-                    status = s.surface->query(NATIVE_WINDOW_FORMAT, &format);
-                    ALOGE_IF(status != NO_ERROR, "Unable to query format (%d)", status);
+    int width = 0, height = 0, format = 0;
 #ifdef QTI_DISPLAY_CONFIG_ENABLED
-                    size_t maxVirtualDisplaySize =
-                        getHwComposer().getMaxVirtualDisplayDimension();
-                    if ((mDisplayConfigIntf) && (maxVirtualDisplaySize == 0 ||
-                        ((uint64_t)width <= maxVirtualDisplaySize &&
-                        (uint64_t)height <= maxVirtualDisplaySize))) {
-                        uint64_t usage = 0;
-                        // Replace with native_window_get_consumer_usage ?
-                        status = s.surface->getConsumerUsage(&usage);
-                        ALOGW_IF(status != NO_ERROR, "Unable to query usage (%d)", status);
-                        if ((status == NO_ERROR) && canAllocateHwcDisplayIdForVDS(usage)) {
-                            mDisplayConfigIntf->CreateVirtualDisplay(width, height, format);
-                            return;
-                        }
-                    }
+    bool createVirtualDisplay = false;
 #endif
+
+    {
+        Mutex::Autolock _l(mStateLock);
+        for (const DisplayState& s : displays) {
+            const ssize_t index = mCurrentState.displays.indexOfKey(s.token);
+            if (index < 0)
+                continue;
+
+            DisplayDeviceState& state = mCurrentState.displays.editValueAt(index);
+            const uint32_t what = s.what;
+            if (what & DisplayState::eSurfaceChanged) {
+                if (IInterface::asBinder(state.surface) != IInterface::asBinder(s.surface)) {
+                    if (state.isVirtual() && s.surface != nullptr &&
+                        mVirtualDisplayIdGenerators.hal) {
+                        width = 0;
+                        int status = s.surface->query(NATIVE_WINDOW_WIDTH, &width);
+                        ALOGE_IF(status != NO_ERROR, "Unable to query width (%d)", status);
+                        height = 0;
+                        status = s.surface->query(NATIVE_WINDOW_HEIGHT, &height);
+                        ALOGE_IF(status != NO_ERROR, "Unable to query height (%d)", status);
+                        format = 0;
+                        status = s.surface->query(NATIVE_WINDOW_FORMAT, &format);
+                        ALOGE_IF(status != NO_ERROR, "Unable to query format (%d)", status);
+#ifdef QTI_DISPLAY_CONFIG_ENABLED
+                        size_t maxVirtualDisplaySize =
+                            getHwComposer().getMaxVirtualDisplayDimension();
+                        if ((mDisplayConfigIntf) && (maxVirtualDisplaySize == 0 ||
+                            ((uint64_t)width <= maxVirtualDisplaySize &&
+                            (uint64_t)height <= maxVirtualDisplaySize))) {
+                            uint64_t usage = 0;
+                            // Replace with native_window_get_consumer_usage ?
+                            status = s.surface->getConsumerUsage(&usage);
+                            ALOGW_IF(status != NO_ERROR, "Unable to query usage (%d)", status);
+                            if ((status == NO_ERROR) && canAllocateHwcDisplayIdForVDS(usage)) {
+                                createVirtualDisplay = true;
+                                break;
+                            }
+                        }
+#endif
+                    }
                 }
             }
         }
     }
+
+#ifdef QTI_DISPLAY_CONFIG_ENABLED
+    if(createVirtualDisplay) {
+        mDisplayConfigIntf->CreateVirtualDisplay(width, height, format);
+    }
+#endif
 }
 
 uint32_t SurfaceFlinger::setDisplayStateLocked(const DisplayState& s) {
@@ -8343,6 +8362,8 @@ status_t SurfaceFlinger::setDesiredDisplayModeSpecsInternal(
         LOG_ALWAYS_FATAL("Desired display mode not allowed: %d",
                          preferredDisplayMode->getId().value());
     }
+
+    setRefreshRates(display);
 
     return NO_ERROR;
 }
