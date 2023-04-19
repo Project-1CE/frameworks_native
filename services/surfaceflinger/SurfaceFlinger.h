@@ -809,7 +809,7 @@ private:
     // Called on the main thread in response to initializeDisplays()
     void onInitializeDisplays() REQUIRES(mStateLock);
     // Sets the desired active mode bit. It obtains the lock, and sets mDesiredActiveMode.
-    void setDesiredActiveMode(const ActiveModeInfo& info) REQUIRES(mStateLock);
+    void setDesiredActiveMode(const ActiveModeInfo& info, bool force = false) REQUIRES(mStateLock);
     status_t setActiveModeFromBackdoor(const sp<IBinder>& displayToken, int id);
     // Sets the active mode and a new refresh rate in SF.
     void updateInternalStateWithChangedMode() REQUIRES(mStateLock);
@@ -831,6 +831,9 @@ private:
             const sp<DisplayDevice>& display,
             const std::optional<scheduler::RefreshRateConfigs::Policy>& policy, bool overridePolicy)
             EXCLUDES(mStateLock);
+
+    status_t applyRefreshRateConfigsPolicy(const sp<DisplayDevice>&, bool force = false)
+            REQUIRES(mStateLock);
 
     void commitTransactions() EXCLUDES(mStateLock);
     void commitTransactionsLocked(uint32_t transactionFlags) REQUIRES(mStateLock);
@@ -865,7 +868,7 @@ private:
      * Transactions
      */
     bool applyTransactionState(const FrameTimelineInfo& info, Vector<ComposerState>& state,
-                               const Vector<DisplayState>& displays, uint32_t flags,
+                               Vector<DisplayState>& displays, uint32_t flags,
                                const InputWindowCommands& inputWindowCommands,
                                const int64_t desiredPresentTime, bool isAutoTimestamp,
                                const client_cache_t& uncacheBuffer, const int64_t postTime,
@@ -1122,7 +1125,6 @@ private:
      */
     nsecs_t getVsyncPeriodFromHWC() const REQUIRES(mStateLock);
     nsecs_t getVsyncPeriodFromHWCcb();
-    sp<DisplayDevice> getCurrentVsyncSource();
 
     void setHWCVsyncEnabled(PhysicalDisplayId id, hal::Vsync enabled) {
         mLastHWCVsyncState = enabled;
@@ -1205,8 +1207,10 @@ private:
     /*
      * Debugging & dumpsys
      */
-    void dumpAllLocked(const DumpArgs& args, std::string& result) const REQUIRES(mStateLock);
+    void dumpAllLocked(const DumpArgs& args, const std::string& compositionLayers,
+                       std::string& result) const REQUIRES(mStateLock);
     void dumpMini(std::string& result) const REQUIRES(mStateLock);
+
     void appendSfConfigString(std::string& result) const;
     void listLayersLocked(std::string& result) const;
     void dumpStatsLocked(const DumpArgs& args, std::string& result) const REQUIRES(mStateLock);
@@ -1674,12 +1678,12 @@ private:
         return mScheduler->getLayerFramerate(now, id);
     }
 
+    bool mPowerHintSessionEnabled;
+
     struct {
-        bool sessionEnabled = false;
-        nsecs_t commitStart;
-        nsecs_t compositeStart;
-        nsecs_t presentEnd;
-    } mPowerHintSessionData GUARDED_BY(kMainThreadContext);
+        bool late = false;
+        bool early = false;
+    } mPowerHintSessionMode;
 
     nsecs_t mAnimationTransactionTimeout = s2ns(5);
 
