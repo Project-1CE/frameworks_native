@@ -1,4 +1,4 @@
-/* Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
+/* Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  */
 #include "QtiNullExtension.h"
@@ -55,6 +55,8 @@ bool QtiNullExtension::qtiLatchMediaContent(sp<Layer> layer) {
 }
 void QtiNullExtension::qtiUpdateBufferData(bool qtiLatchMediaContent, const layer_state_t& s) {}
 
+void QtiNullExtension::qtiOnComposerHalRefresh() {}
+
 /*
  * Methods that call the FeatureManager APIs.
  */
@@ -107,6 +109,11 @@ status_t QtiNullExtension::qtiBinderSetPanelBrightnessTiled(uint64_t displayId, 
 status_t QtiNullExtension::qtiBinderSetWideModePreference(uint64_t displayId, int32_t pref) {
     return OK;
 }
+status_t QtiNullExtension::qtiDoDumpContinuous(int fd, const DumpArgs& args) {
+    return OK;
+}
+void QtiNullExtension::qtiDumpDrawCycle(bool prePrepare) {}
+
 /*
  * Methods for Virtual, WiFi, and Secure Displays
  */
@@ -168,6 +175,9 @@ uint32_t QtiNullExtension::qtiGetLayerClass(std::string mName) {
 }
 void QtiNullExtension::qtiSetVisibleLayerInfo(DisplayId displayId,
                                                   const char* name, int32_t sequence) {}
+bool QtiNullExtension::qtiIsSmomoOptimalRefreshActive() {
+    return false;
+}
 
 /*
  * Methods for speculative fence
@@ -199,5 +209,6 @@ bool QtiNullExtension::qtiFbScalingOnDisplayChange(const wp<IBinder>& displayTok
 }
 
 void QtiNullExtension::qtiFbScalingOnPowerChange(sp<DisplayDevice> display) {}
+void QtiNullExtension::qtiDumpMini(std::string& result) {}
 
 } // namespace android::surfaceflingerextension

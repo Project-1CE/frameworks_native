@@ -16,7 +16,7 @@
 
 /* Changes from Qualcomm Innovation Center are provided under the following license:
  *
- * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  */
 
@@ -861,10 +861,6 @@ void SurfaceFlinger::init() FTL_FAKE_GUARD(kMainThreadContext) {
 
     enableLatchUnsignaledConfig = getLatchUnsignaledConfig();
 
-    if (base::GetBoolProperty("debug.sf.enable_hwc_vds"s, false)) {
-        enableHalVirtualDisplays(true);
-    }
-
     // Process hotplug for displays connected at boot.
     LOG_ALWAYS_FATAL_IF(!configureLocked(),
                         "Initial display configuration failed: HWC did not hotplug");
@@ -938,6 +934,11 @@ void SurfaceFlinger::init() FTL_FAKE_GUARD(kMainThreadContext) {
                                         mVsyncConfiguration.get(), getHwComposer().getComposer());
    surfaceflingerextension::QtiExtensionContext::instance().setCompositionEngine(
             &getCompositionEngine());
+
+    if (base::GetBoolProperty("debug.sf.enable_hwc_vds"s, false)) {
+        enableHalVirtualDisplays(true);
+    }
+
     mQtiSFExtnIntf->qtiStartUnifiedDraw();
     /* QTI_END */
     ALOGV("Done initializing");
@@ -2155,6 +2156,9 @@ void SurfaceFlinger::onComposerHalSeamlessPossible(hal::HWDisplayId) {
 
 void SurfaceFlinger::onComposerHalRefresh(hal::HWDisplayId) {
     Mutex::Autolock lock(mStateLock);
+    /* QTI_BEGIN */
+    mQtiSFExtnIntf->qtiOnComposerHalRefresh();
+    /* QTI_END */
     scheduleComposite(FrameHint::kNone);
 }
 
@@ -2426,6 +2430,10 @@ bool SurfaceFlinger::commit(TimePoint frameTime, VsyncId vsyncId, TimePoint expe
     const TimePoint lastScheduledPresentTime = mScheduledPresentTime;
 
     /* QTI_BEGIN */
+    std::unique_lock<std::mutex> lck (mSmomoMutex, std::defer_lock);
+    if (mQtiSFExtnIntf->qtiIsSmomoOptimalRefreshActive()) {
+      lck.lock();
+    }
     mQtiSFExtnIntf->qtiOnVsync(expectedVsyncTime.ns());
     /* QTI_END */
 
@@ -2726,6 +2734,11 @@ void SurfaceFlinger::composite(TimePoint frameTime, VsyncId vsyncId)
 
     std::vector<std::pair<Layer*, LayerFE*>> layers =
             moveSnapshotsToCompositionArgs(refreshArgs, /*cursorOnly=*/false, vsyncId.value);
+
+    /* QTI_BEGIN */
+    mQtiSFExtnIntf->qtiDumpDrawCycle(true);
+    /* QTI_END */
+
     mCompositionEngine->present(refreshArgs);
     moveSnapshotsFromCompositionArgs(refreshArgs, layers);
 
@@ -3076,6 +3089,10 @@ void SurfaceFlinger::postComposition(nsecs_t callTime) {
             mScheduler->enableHardwareVsync(defaultDisplay->getPhysicalId());
         }
     }
+
+    /* QTI_BEGIN */
+    mQtiSFExtnIntf->qtiDumpDrawCycle(false);
+    /* QTI_END */
 
     const size_t sfConnections = mScheduler->getEventThreadConnectionCount(mSfConnectionHandle);
     const size_t appConnections = mScheduler->getEventThreadConnectionCount(mAppConnectionHandle);
@@ -3681,6 +3698,9 @@ void SurfaceFlinger::processDisplayChanged(const wp<IBinder>& displayToken,
             if (display->isVirtual()) {
                 releaseVirtualDisplay(display->getVirtualId());
             }
+            /* QTI_BEGIN */
+            mQtiSFExtnIntf->qtiDestroySmomoInstance(display);
+            /* QTI_END */
         }
 
         mDisplays.erase(displayToken);
@@ -4065,6 +4085,14 @@ void SurfaceFlinger::requestDisplayModes(std::vector<display::DisplayModeRequest
     // Scheduler::chooseRefreshRateForContent
 
     ConditionalLock lock(mStateLock, std::this_thread::get_id() != mMainThreadId);
+    /* QTI_BEGIN */
+    // Setting mRequestDisplayModeFlag as true and storing thread Id to avoid acquiring the same
+    // mutex again in a single thread
+    if (std::this_thread::get_id() != mMainThreadId) {
+        mRequestDisplayModeFlag = true;
+        mFlagThread = std::this_thread::get_id();
+    }
+    /* QTI_END */
 
     for (auto& request : modeRequests) {
         const auto& modePtr = request.mode.modePtr;
@@ -4097,6 +4125,12 @@ void SurfaceFlinger::requestDisplayModes(std::vector<display::DisplayModeRequest
                   to_string(display->getId()).c_str());
         }
     }
+    /* QTI_BEGIN */
+    if (std::this_thread::get_id() != mMainThreadId) {
+        mRequestDisplayModeFlag = false;
+        mFlagThread = mMainThreadId;
+    }
+    /* QTI_END */
 }
 
 void SurfaceFlinger::triggerOnFrameRateOverridesChanged() {
@@ -4576,24 +4610,25 @@ TransactionHandler::TransactionReadiness SurfaceFlinger::transactionReadyBufferC
         }
         /* QTI_END */
 
+        /* QTI_BEGIN */
+        bool qtiLatchMediaContent = mQtiSFExtnIntf->qtiLatchMediaContent(layer);
+        /* QTI_END */
+
         // ignore the acquire fence if LatchUnsignaledConfig::Always is set.
-        const bool checkAcquireFence = enableLatchUnsignaledConfig != LatchUnsignaledConfig::Always;
+        const bool checkAcquireFence = enableLatchUnsignaledConfig != LatchUnsignaledConfig::Always
+            /* QTI_BEGIN */ || qtiLatchMediaContent /* QTI_END */;
         const bool acquireFenceAvailable = s.bufferData &&
                 s.bufferData->flags.test(BufferData::BufferDataChange::fenceChanged) &&
                 s.bufferData->acquireFence;
         const bool fenceSignaled = !checkAcquireFence || !acquireFenceAvailable ||
                 s.bufferData->acquireFence->getStatus() != Fence::Status::Unsignaled;
 
-        /* QTI_BEGIN */
-        bool qtiLatchMediaContent = mQtiSFExtnIntf->qtiLatchMediaContent(layer);
-        /* QTI_END */
-
         if (!fenceSignaled) {
             // check fence status
             const bool allowLatchUnsignaled =
                     shouldLatchUnsignaled(layer, s, transaction.states.size(),
                                           flushState.firstTransaction);
-            if (allowLatchUnsignaled /* QTI_BEGIN */ || qtiLatchMediaContent /* QTI_END */) {
+            if (allowLatchUnsignaled /* QTI_BEGIN */ || !qtiLatchMediaContent /* QTI_END */) {
                 ATRACE_FORMAT("fence unsignaled try allowLatchUnsignaled %s",
                               layer->getDebugName());
                 ready = TransactionReadiness::NotReadyUnsignaled;
@@ -4735,6 +4770,12 @@ status_t SurfaceFlinger::setTransactionState(
         const std::vector<ListenerCallbacks>& listenerCallbacks, uint64_t transactionId,
         const std::vector<uint64_t>& mergedTransactionIds) {
     ATRACE_CALL();
+    /* QTI_BEGIN */
+    std::unique_lock<std::mutex> lck (mSmomoMutex, std::defer_lock);
+    if (mQtiSFExtnIntf->qtiIsSmomoOptimalRefreshActive()) {
+      lck.lock();
+    }
+    /* QTI_END */
 
     IPCThreadState* ipc = IPCThreadState::self();
     const int originPid = ipc->getCallingPid();
@@ -4797,7 +4838,9 @@ status_t SurfaceFlinger::setTransactionState(
                                                      layerName.c_str(), transactionId);
 
             /* QTI_BEGIN */
-            mQtiSFExtnIntf->qtiDolphinTrackBufferIncrement(layerName.c_str());
+            if (!(flags & eOneWay)) {
+                mQtiSFExtnIntf->qtiDolphinTrackBufferIncrement(layerName.c_str());
+            }
 
             mQtiSFExtnIntf->qtiUpdateSmomoLayerInfo(layer, desiredPresentTime, isAutoTimestamp,
                                                     resolvedState.externalTexture,
@@ -5866,6 +5909,13 @@ void SurfaceFlinger::setPowerMode(const sp<IBinder>& displayToken, int mode) {
 }
 
 status_t SurfaceFlinger::doDump(int fd, const DumpArgs& args, bool asProto) {
+    /* QTI_BEGIN */
+    size_t numArgs = args.size();
+    if (numArgs && ((args[0] == String16("--file")) ||
+        (args[0] == String16("--allocated_buffers")))) {
+        return mQtiSFExtnIntf->qtiDoDumpContinuous(fd, args);
+    }
+    /* QTI_END */
     std::string result;
 
     IPCThreadState* ipc = IPCThreadState::self();
@@ -5920,19 +5970,44 @@ status_t SurfaceFlinger::doDump(int fd, const DumpArgs& args, bool asProto) {
 
         bool dumpLayers = true;
         {
-            TimedLock lock(mStateLock, s2ns(1), __func__);
-            if (!lock.locked()) {
-                StringAppendF(&result, "Dumping without lock after timeout: %s (%d)\n",
-                              strerror(-lock.status), lock.status);
-                ALOGW("Dumping without lock after timeout: %s (%d)",
-                              strerror(-lock.status), lock.status);
+            /* QTI_BEGIN */
+            {
+            /* QTI_END */
+                TimedLock lock(mStateLock, s2ns(1), __func__);
+                if (!lock.locked()) {
+                    StringAppendF(&result, "Dumping without lock after timeout: %s (%d)\n",
+                                strerror(-lock.status), lock.status);
+                    ALOGW("Dumping without lock after timeout: %s (%d)",
+                                strerror(-lock.status), lock.status);
+                    /* QTI_BEGIN */
+                    return NO_ERROR;
+                    /* QTI_END */
+                }
+            /* QTI_BEGIN */
             }
+            /* QTI_END */
 
             if (const auto it = dumpers.find(flag); it != dumpers.end()) {
-                (it->second)(args, asProto, result);
+                /* QTI_BEGIN */
+                TimedLock lock(mStateLock, s2ns(1), __func__);
+                if (lock.locked()) {
+                   (it->second)(args, asProto, result);
+                }
+                /* QTI_END */
                 dumpLayers = false;
             } else if (!asProto) {
-                dumpAllLocked(args, compositionLayers, result);
+                /* QTI_BEGIN */
+                // selection of mini dumpsys (Format: adb shell dumpsys SurfaceFlinger --mini)
+                if (numArgs && ((args[0] == String16("--mini")))) {
+                    mQtiSFExtnIntf->qtiDumpMini(result);
+                    dumpLayers = false;
+                } else {
+                    TimedLock lock(mStateLock, s2ns(1), __func__);
+                    if (lock.locked()) {
+                       dumpAllLocked(args, compositionLayers, result);
+                    }
+                }
+                /* QTI_END */
             }
         }
 
